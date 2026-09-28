@@ -373,7 +373,7 @@ pub async fn search_project_inner(
     // user typed verbatim.
     if !query_phrase.is_empty() {
         let phrase_query =
-            crate::commands::segment::build_fts_match_query(&[query_phrase.clone()]);
+            crate::commands::segment::build_fts_match_query(std::slice::from_ref(&query_phrase));
         for path in db.search_candidates(&phrase_query, CANDIDATE_LIMIT)? {
             if !candidate_paths.contains(&path) {
                 candidate_paths.push(path);

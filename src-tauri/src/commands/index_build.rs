@@ -10,9 +10,6 @@ use crate::commands::index_db::{IndexDb, IndexPage};
 pub struct BuildStats {
     pub pages: usize,
     pub links: usize,
-    // Part of the stats contract reported to callers; nothing skips a page yet.
-    #[allow(dead_code)]
-    pub skipped: usize,
 }
 
 fn content_hash(content: &str) -> String {
@@ -92,7 +89,6 @@ pub fn build_index(db: &mut IndexDb, project_path: &str) -> Result<BuildStats, S
     Ok(BuildStats {
         pages: total,
         links: link_count,
-        skipped: 0,
     })
 }
 

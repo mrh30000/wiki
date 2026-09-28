@@ -81,15 +81,11 @@ pub struct IndexDb {
     conn: Connection,
 }
 
-// Index location and open/close are the entry points the ingest and query
-// paths in later tasks call; nothing consumes them yet.
-#[allow(dead_code)]
 pub fn index_db_path(project_path: &str) -> PathBuf {
     Path::new(project_path).join(".llm-wiki").join("index.db")
 }
 
 impl IndexDb {
-    #[allow(dead_code)]
     pub fn open(project_path: &str) -> Result<IndexDb, String> {
         let path = index_db_path(project_path);
         if let Some(parent) = path.parent() {
@@ -104,6 +100,8 @@ impl IndexDb {
         Ok(db)
     }
 
+    // Used by unit tests across index_db and index_build modules for isolated in-memory verification.
+    #[allow(dead_code)]
     pub fn open_in_memory() -> Result<IndexDb, String> {
         let conn = Connection::open_in_memory()
             .map_err(|e| format!("无法创建内存索引库: {e}"))?;
@@ -112,7 +110,6 @@ impl IndexDb {
         Ok(db)
     }
 
-    #[allow(dead_code)]
     fn apply_pragmas(&self) -> Result<(), String> {
         // WAL: readers never block the indexer (Review Focus #4).
         self.conn
@@ -154,7 +151,6 @@ impl IndexDb {
     /// Stamp the schema version. Called after a successful rebuild so the
     /// stale-version flag actually clears; `ensure_schema` deliberately does
     /// NOT overwrite an existing version.
-    #[allow(dead_code)]
     pub(crate) fn set_schema_version(&self, version: i64) -> Result<(), String> {
         self.conn
             .execute(
