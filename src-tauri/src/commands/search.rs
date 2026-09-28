@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use walkdir::WalkDir;
 
+use crate::commands::index_db::{IndexDb, INDEX_SCHEMA_VERSION};
 use crate::commands::vectorstore;
 use crate::panic_guard::run_guarded_async;
 
@@ -21,6 +22,10 @@ const CONTENT_TOKEN_WEIGHT: f64 = 1.0;
 const SNIPPET_CONTEXT: usize = 80;
 const SEARCH_EMBEDDING_TIMEOUT_SECS: u64 = 8;
 const MAX_SEARCH_FILES: usize = 10_000;
+/// Upper bound on pages handed to the scorer. This bounds memory and IO per
+/// query; it is NOT a silent truncation of the corpus, because candidates are
+/// selected by relevance rather than by directory order.
+const CANDIDATE_LIMIT: usize = 2_000;
 const MIN_GRAPH_RESULT_RATIO: f64 = 0.15;
 const MAX_GRAPH_RESULT_RATIO: f64 = 0.30;
 const MAX_GRAPH_SEEDS: usize = 20;
@@ -347,69 +352,77 @@ pub async fn search_project_inner(
     let mut legacy_stem_candidates = BTreeMap::<String, Vec<String>>::new();
     let mut graph_pages = BTreeMap::new();
 
-    let wiki_root = Path::new(&project_path).join("wiki");
-    if wiki_root.exists() {
-        let mut searched_files = 0usize;
-        for entry in WalkDir::new(&wiki_root).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file()
-                || !entry
-                    .path()
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-            {
-                continue;
+    // Candidates come from the derived index instead of a full directory walk.
+    // BM25 only orders the candidate set for truncation; final ranking stays
+    // with score_file/RRF (spec invariant 5).
+    // Self-heal: the index is a discardable derivative, so a missing, empty,
+    // or stale index is rebuilt rather than surfaced as an error
+    // (spec invariant 2, Review Focus #2).
+    let mut db = IndexDb::open(&project_path)?;
+    let stale = db.schema_version().unwrap_or(0) != INDEX_SCHEMA_VERSION;
+    if stale || db.page_count().unwrap_or(0) == 0 {
+        let _ = crate::commands::project_maintenance::rebuild_index_db_inner(project_path.clone());
+        db = IndexDb::open(&project_path)?;
+    }
+    let match_query = crate::commands::segment::build_fts_match_query(&effective_tokens);
+    let mut candidate_paths = db.search_candidates(&match_query, CANDIDATE_LIMIT)?;
+    // Always probe the exact phrase too: token expansion can drop a page the
+    // user typed verbatim.
+    if !query_phrase.is_empty() {
+        let phrase_query =
+            crate::commands::segment::build_fts_match_query(&[query_phrase.clone()]);
+        for path in db.search_candidates(&phrase_query, CANDIDATE_LIMIT)? {
+            if !candidate_paths.contains(&path) {
+                candidate_paths.push(path);
             }
-            searched_files += 1;
-            if searched_files > MAX_SEARCH_FILES {
-                eprintln!(
-                    "[Search] stopped scanning wiki after {MAX_SEARCH_FILES} markdown files in {project_path}"
-                );
-                break;
-            }
-            let content = match fs::read_to_string(entry.path()) {
-                Ok(content) => content,
-                Err(_) => continue,
-            };
-            let relative_path = relative_to_project(&project_path, entry.path());
-            if let Some(vector_id) = vector_page_id(&relative_path) {
-                page_paths_by_vector_id.insert(vector_id, relative_path.clone());
-            }
-            if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
-                legacy_stem_candidates
-                    .entry(stem.to_string())
-                    .or_default()
-                    .push(relative_path.clone());
-            }
-            let title = extract_title(
-                &content,
-                entry
-                    .path()
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or_default(),
-            );
-            let hit = score_file(
-                &project_path,
-                entry.path(),
-                &content,
-                &effective_tokens,
-                &query_phrase,
-                &query,
-                include_content,
-            );
-            graph_pages.insert(
-                normalize_path(&relative_path),
-                GraphPage {
-                    path: relative_path,
-                    title,
-                    links: extract_graph_links(&content),
-                    content,
-                },
-            );
-            if let Some(hit) = hit {
-                results.push(hit);
-            }
+        }
+    }
+
+    for relative_path in candidate_paths {
+        let absolute = Path::new(&project_path).join(&relative_path);
+        let content = match fs::read_to_string(&absolute) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        if let Some(vector_id) = vector_page_id(&relative_path) {
+            page_paths_by_vector_id.insert(vector_id, relative_path.clone());
+        }
+        if let Some(stem) = absolute.file_stem().and_then(|s| s.to_str()) {
+            legacy_stem_candidates
+                .entry(stem.to_string())
+                .or_default()
+                .push(relative_path.clone());
+        }
+        let title = extract_title(
+            &content,
+            absolute
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default(),
+        );
+        let hit = score_file(
+            &project_path,
+            &absolute,
+            &content,
+            &effective_tokens,
+            &query_phrase,
+            &query,
+            include_content,
+        );
+        // P0: graph_pages now covers only the candidate set, so graph
+        // expansion is shallower than the pre-index behaviour. P2.2
+        // restores depth by reading the `links` table.
+        graph_pages.insert(
+            normalize_path(&relative_path),
+            GraphPage {
+                path: relative_path,
+                title,
+                links: extract_graph_links(&content),
+                content,
+            },
+        );
+        if let Some(hit) = hit {
+            results.push(hit);
         }
     }
     let legacy_page_paths = legacy_stem_candidates
@@ -477,6 +490,43 @@ pub async fn search_project_inner(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.path.cmp(&b.path))
     });
+    // Blend 1-hop graph neighbors of top seeds by reading referenced neighbor pages into graph_pages.
+    let seed_links: Vec<String> = results
+        .iter()
+        .take(limit.min(MAX_GRAPH_SEEDS))
+        .filter_map(|r| graph_pages.get(&normalize_path(&r.path)))
+        .flat_map(|page| page.links.clone())
+        .collect();
+    if !seed_links.is_empty() {
+        if let Ok(neighbor_paths) = db.resolve_neighbor_paths(&seed_links) {
+            for neighbor_path in neighbor_paths {
+                if graph_pages.contains_key(&normalize_path(&neighbor_path)) {
+                    continue;
+                }
+                let absolute = Path::new(&project_path).join(&neighbor_path);
+                let content = match fs::read_to_string(&absolute) {
+                    Ok(content) => content,
+                    Err(_) => continue,
+                };
+                let title = extract_title(
+                    &content,
+                    absolute
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or_default(),
+                );
+                graph_pages.insert(
+                    normalize_path(&neighbor_path),
+                    GraphPage {
+                        path: neighbor_path,
+                        title,
+                        links: extract_graph_links(&content),
+                        content,
+                    },
+                );
+            }
+        }
+    }
     let graph_hits = blend_graph_results(
         &mut results,
         &graph_pages,
@@ -692,7 +742,7 @@ fn blend_graph_results(
     graph_count
 }
 
-fn normalize_graph_alias(value: &str) -> String {
+pub(crate) fn normalize_graph_alias(value: &str) -> String {
     value
         .split('#')
         .next()
@@ -2424,6 +2474,169 @@ mod tests {
         .unwrap();
 
         assert_eq!(out.results[0].title, "Phrase");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn index_fixture(root: &Path, pages: usize) {
+        for i in 0..pages {
+            let dir = root.join("wiki/bulk");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join(format!("p{i}.md")),
+                format!("# Page {i}\n\ncommon filler text 灾备集群 number {i}\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn searches_beyond_ten_thousand_pages() {
+        let root = tmp_project();
+        index_fixture(&root, 10_050);
+        // The needle sits past the old MAX_SEARCH_FILES boundary.
+        fs::write(
+            root.join("wiki/bulk/zz_needle.md"),
+            "# Needle\n\n唯一标记词 逆向工程\n",
+        )
+        .unwrap();
+
+        let mut db = crate::commands::index_db::IndexDb::open(root.to_string_lossy().as_ref())
+            .unwrap();
+        crate::commands::index_build::build_index(&mut db, root.to_string_lossy().as_ref())
+            .unwrap();
+        drop(db);
+
+        let resp = search_project_inner(
+            root.to_string_lossy().into_owned(),
+            "逆向工程".to_string(),
+            20,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            resp.results.iter().any(|r| r.path.ends_with("zz_needle.md")),
+            "page beyond 10k must be findable; got {} results",
+            resp.results.len()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn two_character_cjk_query_matches() {
+        // Review Focus #1.
+        let root = tmp_project();
+        write_page(&root, "wiki/concepts/dr.md", "# 灾备\n\n巡检流程每 3n 秒采样。");
+        let mut db = crate::commands::index_db::IndexDb::open(root.to_string_lossy().as_ref())
+            .unwrap();
+        crate::commands::index_build::build_index(&mut db, root.to_string_lossy().as_ref())
+            .unwrap();
+        drop(db);
+
+        for q in ["巡检", "灾备"] {
+            let resp = search_project_inner(
+                root.to_string_lossy().into_owned(),
+                q.to_string(),
+                20,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(!resp.results.is_empty(), "query {q} must match");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn candidate_recall_matches_full_scan() {
+        // Review Focus #5: the candidate set must contain every page the old
+        // full scan would have scored as a hit.
+        let root = tmp_project();
+        for i in 0..200 {
+            write_page(
+                &root,
+                &format!("wiki/recall/p{i}.md"),
+                &format!("# P{i}\n\nalpha beta 灾备 cluster {i}\n"),
+            );
+        }
+        let mut db = crate::commands::index_db::IndexDb::open(root.to_string_lossy().as_ref())
+            .unwrap();
+        crate::commands::index_build::build_index(&mut db, root.to_string_lossy().as_ref())
+            .unwrap();
+
+        let tokens = tokenize_query("灾备 cluster");
+        let match_query = crate::commands::segment::build_fts_match_query(&tokens);
+        let candidates = db.search_candidates(&match_query, 1_000).unwrap();
+        assert_eq!(
+            candidates.len(),
+            200,
+            "every matching page must be a candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_index_is_rebuilt_not_fatal() {
+        // Review Focus #2.
+        let root = tmp_project();
+        write_page(&root, "wiki/a.md", "# A\n\n灾备集群");
+        let db_path = crate::commands::index_db::index_db_path(root.to_string_lossy().as_ref());
+        let _ = fs::remove_file(&db_path);
+
+        let resp = search_project_inner(
+            root.to_string_lossy().into_owned(),
+            "灾备".to_string(),
+            20,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!resp.results.is_empty(), "missing index must self-heal");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn stale_schema_version_triggers_rebuild() {
+        // Review Focus #2: an index written by an older app version.
+        // Build a POPULATED index first, then mark it stale — otherwise this
+        // test would pass via the empty-index path and never exercise the
+        // schema check at all.
+        let root = tmp_project();
+        write_page(&root, "wiki/a.md", "# A\n\n灾备集群");
+        {
+            let mut db =
+                crate::commands::index_db::IndexDb::open(root.to_string_lossy().as_ref())
+                    .unwrap();
+            crate::commands::index_build::build_index(
+                &mut db,
+                root.to_string_lossy().as_ref(),
+            )
+            .unwrap();
+            db.set_schema_version(0).unwrap();
+            assert_eq!(db.page_count().unwrap(), 1, "fixture must be populated");
+        }
+        let resp = search_project_inner(
+            root.to_string_lossy().into_owned(),
+            "灾备".to_string(),
+            20,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!resp.results.is_empty(), "stale schema must self-heal");
+        // The rebuild must have cleared the stale flag, or every later search
+        // rebuilds again.
+        let after = crate::commands::index_db::IndexDb::open(root.to_string_lossy().as_ref())
+            .unwrap();
+        assert_eq!(
+            after.schema_version().unwrap(),
+            crate::commands::index_db::INDEX_SCHEMA_VERSION,
+            "rebuild must stamp the current version"
+        );
         let _ = fs::remove_dir_all(root);
     }
     #[test]

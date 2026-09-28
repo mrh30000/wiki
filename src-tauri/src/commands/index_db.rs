@@ -252,6 +252,53 @@ impl IndexDb {
             .map_err(|e| e.to_string())?;
         Ok(n as usize)
     }
+
+    /// Resolve 1-hop link references to page paths by matching against pages.
+    pub fn resolve_neighbor_paths(&self, seed_links: &[String]) -> Result<Vec<String>, String> {
+        if seed_links.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, title FROM pages")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut target_aliases = std::collections::HashSet::new();
+        for link in seed_links {
+            target_aliases.insert(crate::commands::search::normalize_graph_alias(link));
+        }
+
+        let mut matched_paths = Vec::new();
+        for row in rows {
+            let (path, title) = row.map_err(|e| e.to_string())?;
+            let wiki_relative = path.strip_prefix("wiki/").unwrap_or(&path);
+            let stem = std::path::Path::new(&path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            let mut matches = false;
+            for candidate in [
+                path.as_str(),
+                wiki_relative,
+                stem,
+                title.as_deref().unwrap_or_default(),
+            ] {
+                if target_aliases.contains(&crate::commands::search::normalize_graph_alias(candidate)) {
+                    matches = true;
+                    break;
+                }
+            }
+            if matches {
+                matched_paths.push(path);
+            }
+        }
+        Ok(matched_paths)
+    }
 }
 
 #[cfg(test)]
