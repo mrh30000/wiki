@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::commands::search::tokenize_query;
 
 /// Insert a space after every CJK ideograph so unicode61 emits one token per
@@ -56,7 +57,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_is_symmetric_for_write_and_query() {
+    fn segments_query_terms_and_preserves_expected_shape() {
         let raw = "灾备集群部署在华东2区";
         let indexed = segment_for_fts(raw);
         // A 2-character CJK query must survive the round trip (Review Focus #1).
@@ -74,6 +75,16 @@ mod tests {
             assert!(q.starts_with('"') && q.ends_with('"'), "unquoted: {q}");
             assert_eq!(q.matches('"').count() % 2, 0, "unbalanced quotes: {q}");
         }
+
+        // The two structural assertions above CANNOT detect a broken escaper:
+        // an unescaped `he said "hi"` yields `"he said "hi""` — 4 quotes
+        // (even) and still starts/ends with a quote. So pin the exact escaped
+        // output too, or removing the escaping would pass this test silently.
+        assert_eq!(
+            build_fts_match_query(&["he said \"hi\"".to_string()]),
+            "\"he said \"\"hi\"\"\""
+        );
+        assert_eq!(build_fts_match_query(&["\"".to_string()]), "\"\"\"\"");
     }
 
     #[test]
