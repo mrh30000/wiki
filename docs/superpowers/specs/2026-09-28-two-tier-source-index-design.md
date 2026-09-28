@@ -132,11 +132,12 @@ CREATE INDEX idx_links_src ON links(src_page_id);
 CREATE INDEX idx_links_dst ON links(dst_page_id);
 
 -- 关键词检索：替代 E1/E2/E3
--- tokenize 默认取 'trigram'（CJK 子串匹配可用）。该选择以 P0.1 前置 spike 的
--- 中文检索质量实测结论为准；若 spike 否决 trigram，则改为自定义分词器，
--- 本表结构与其余设计不受影响。
+-- 分词方案已实测确定（见 §13.1）：CJK 逐字切分 + unicode61 + 短语查询。
+-- body/title 存「切分后」文本用于匹配；body_raw 存原始文本（UNINDEXED）供摘要展示。
+-- 切分函数 segment_for_fts(s) 在写入与查询两侧对称应用，查询侧以短语引号包裹。
 CREATE VIRTUAL TABLE pages_fts USING fts5(
-  title, body, heading_path, page_id UNINDEXED, tokenize = 'trigram');
+  title, body, heading_path, page_id UNINDEXED, body_raw UNINDEXED,
+  tokenize = 'unicode61');
 
 -- 持久化队列 + DLQ（对应 WeKnora task_pending_ops / task_dead_letters）
 CREATE TABLE jobs(
@@ -189,7 +190,7 @@ CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);  -- schema_version
 
 | 项 | 内容 | 验收门 |
 |---|---|---|
-| P0.1 | `index.db` schema + FTS5 + 扩展 `rebuild_wiki_index` 重建索引层 | 10K fixture 可重建；`rm index.db` 后重建，检索结果**逐条一致** |
+| P0.1 | `index.db` schema + FTS5 + 扩展 `rebuild_wiki_index` 重建索引层 | 10K fixture 可重建；`rm index.db` 后重建，检索结果**逐条一致**；**中文二字词可命中**（如「巡检」「灾备」，防回归 §13.1 的 trigram 陷阱） |
 | P0.2 | `search_project` 改查 `pages_fts`；删除 `MAX_SEARCH_FILES` 截断 | **第 10,001 个文件可被搜到**；1K/10K/100K 三档查询延迟呈亚线性 |
 | P0.3 | LanceDB `create_index`（ANN）+ 维度分区索引 | 100K chunk 下 P99 达标；recall@10 对比暴力扫描 ≥ 0.95 |
 
@@ -215,7 +216,11 @@ CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);  -- schema_version
 
 1. **既有项目**：首次打开时若 `schema_version` 缺失，从 `raw/sources/` + `wiki/` 全量构建 `index.db`；不得阻塞 UI（后台任务 + 进度）。
 2. **回填**：`sources` 行由 `raw/sources/` 目录扫描 + `ingest-cache.json` 的 `filesWritten` 推导；`ingest-cache.json` 的**文件名键**需迁移为路径键（E11）。
-3. **行为变更**：`autoIngest` 默认值由「开启」变为「关闭」（合成改显式触发）。属**用户可见行为变更**，需设置迁移 + 明确的 UI 提示，不得静默改变既有项目行为。
+3. **行为变更**：`autoIngest` 默认值由 `true` 翻转为 `false`（见 §13.2 决议）。
+   - 唯一事实来源：`src/lib/source-watch-defaults.json` 的 `autoIngest`（当前为 `true`），经 `src/lib/source-watch-config.ts` 消费。
+   - **默认值只影响新项目**：既有项目的已持久化配置不变，因此不会静默改变既有用户行为。
+   - 保留键名 `autoIngest` 不改名（避免配置迁移churn）；语义由 UI 文案明确为「导入时自动**合成** wiki 页」，因为廉价索引在新模型下**恒为开启**。
+   - UI 文案需更新：`source-watch-section.tsx:211,214` 的 `autoIngest` / `autoIngestDescription`。
 4. **回退**：`index.db` 删除后应用仍可运行（检索降级为现有文件遍历路径，保留一个版本周期）。
 5. **`rebuild_wiki_index`** 扩展为同时重建 `wiki/index.md` 与新索引层，作为灾备与修复入口。
 
@@ -238,7 +243,7 @@ CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);  -- schema_version
 
 | 风险 | 级别 | 说明 / 缓解 |
 |---|---|---|
-| **中文分词** | **高** | FTS5 无原生中文分词器。WeKnora 用 ParadeDB `chinese_lindera`。候选：`trigram`（CJK 子串可用）、`unicode61`、自定义分词器。**必须在 P0.1 前完成验证 spike**，否则中文检索质量不达标。 |
+| ~~中文分词~~ | ~~高~~ → **已解决，残留低** | 已实测决议为 CJK 逐字切分 + unicode61 + 短语查询（§13.1）。残留风险：索引体积（逐字 token 较多）与 FTS5 排序质量（无词频加权，BM25 按字统计而非按词）需在 P0.1 用真实中文语料复核。 |
 | 两个派生存储一致性 | 中 | `dataVersion` + outbox（jobs 表）；写入顺序先 SQLite 后 LanceDB |
 | LanceDB ANN 与过滤条件相互作用 | 中 | WeKnora `migrations/versioned/000095_memory_vector_search.up.sql:13` 明确记录「近似索引反而需事后过滤，不如扫描」。小集合 / 强过滤场景**不要盲目上 ANN**，需分档实测 |
 | LanceDB 0.27.2 ANN 索引参数未验证 | 中 | 需实测调参；与 Postgres HNSW 参数不可直接照搬 |
@@ -249,6 +254,7 @@ CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);  -- schema_version
 ### 未决未知
 
 - LanceDB 原生 FTS（Tantivy）在 0.27.2 的实际可用性与质量（方案 B 的备选前提；`tantivy` 经 `lance-index` 已在依赖树内）。
+- FTS5 候选召回率（vs 全量遍历）不足导致新形式漏检——已设为 P0.2 硬验收门。
 - 源文章导入后 `sources` 与 `pages` 的**膨胀比**（一源产出多少页）实测值——直接决定 100K 实际页数。
 - 100K 规模下 SQLite FTS5（trigram）的索引体积与查询 P99。
 
@@ -275,3 +281,59 @@ CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);  -- schema_version
 - WeKnora 存储抽象（原始字节在磁盘/S3，DB 只存元数据）：`internal/types/interfaces/file.go:11-33`
 - WeKnora 规模声明：`CHANGELOG.md` v0.5.2（40k 文档，task queue + DLQ）、v0.6.2（HNSW 1024 维）
 - 本仓现状证据：见本文第 2 节
+
+---
+
+## 13. 决议（Decisions）
+
+以下两项曾在设计评审时标记为待定，现已定案。两项均以可执行探针或代码核实，非推测。
+
+### 13.1 中文分词：CJK 逐字切分 + unicode61 + 短语查询
+
+**决议**：不采用 `trigram`。改用「写入与查询两侧对称切分」：CJK 字符逐字以空格分隔，非 CJK 原样保留；查询侧将切分后的串以短语引号包裹。
+
+**证据**（SQLite 3.50.4 实测）：
+
+| 查询词 | 长度 | `trigram` | 逐字切分 + unicode61 |
+|---|---|---|---|
+| `灾备集群` | 4 | 命中 1 | 命中 1 |
+| `灾备集` | 3 | 命中 1 | 命中 1 |
+| **`灾备`** | **2** | **0（漏）** | 命中 1 |
+| **`巡检`** | **2** | **0（漏）** | 命中 1 |
+| `华东2区` | 4 | 命中 1 | 命中 1 |
+| `ORION-3310` | 10 | 命中 1 | 命中 1 |
+| `disaster` | 8 | 命中 1 | 命中 1 |
+
+**裁决理由**：`trigram` 对 CJK 要求 **≥3 字符**，而二字词恰是中文最常用的检索粒度。纯 trigram 会让「巡检」「灾备」这类词**完全检索不到**，等于把 E1 的静默漏检换个形式重新引入，属不可接受的回归。逐字切分在 1/2/3/4 字词及混合中英场景下全部正确命中；短语查询保证语序敏感（`灾备` 命中、`备灾` 不命中），无误匹配。
+
+**实现要求**：
+- **复用现有 `tokenize_query`（`search.rs:995`），不写第二套 CJK 分词器。** 它已经实现「CJK bigram + 单字 + 完整 token」的候选展开，是当前行为的来源。同一仓内并存两套 CJK 分词语义是重大隐患，必须收斶为一处。
+- `segment_for_fts(s: &str) -> String`：CJK 字符（`U+3400..=U+9FFF`）后补空格，其他字符原样保留。写入侧用此函数。
+- **查询侧**：对 `tokenize_query` 输出的每个 token 分别调用 `segment_for_fts`，各自以双引号包裹为短语，再用 `OR` 连接（如 `"灾 备" OR "巡 检"`）。短语包裹保留语序约束，`OR` 保留了现有「bag-of-tokens」召回语义。
+- `body`/`title` 存切分后文本用于匹配；`body_raw` 存原文（`UNINDEXED`）供结果摘要展示，避免向用户回显带空格的分词文本。
+
+**关键架构后果：FTS5 只做候选生成（召回），Rust 保留现有评分器（排序）。**
+
+这是本决议中最重要的部分，直接保障不变量 5（排序语义不变）：
+
+1. FTS5 从 10K/100K 页中**召回候选集**（大幅缩小），取代当前的 `WalkDir` 全量遍历 + 全量 `read_to_string`。
+2. 现有的 `score_file`（`search.rs:928`）、短语加成、`RRF` 融合**原封不动**地跑在候选集上。因为候选集很小，它仍是廉价的。
+3. **BM25 不参与最终排序**——只用于候选截断时的预排序（若候选数超过阀值）。
+
+**副作用（正向）**：这直接消解了 §10 中「FTS5 按字 BM25 与按词排序不同」的风险——因为我们根本不依赖 BM25 排序。
+
+**残留风险**（见 §10）：逐字 token 使索引体积增大（实测评估）；候选集召回率必须足够高，否则会因「候选里没有」而产生新形式的漏检——**需用「FTS5 候选召回率 vs 全量遍历结果」作为 P0.2 的硬验收门**。
+
+**残留风险**（见 §10）：逐字 token 使索引体积增大；FTS5 的 BM25 按**字**统计，排序不同于按词统计，P0.1 需用真实中文语料复核，必要时在 RRF 融合前做归一化。
+
+### 13.2 `autoIngest` 默认值：翻转为 `false`
+
+**决议**：`src/lib/source-watch-defaults.json` 的 `autoIngest` 由 `true` 改为 `false`。
+
+**已核实的现状**：该键当前为 `true`，经 `src/lib/source-watch-config.ts` 消费（UI 开关在 `src/components/settings/sections/source-watch-section.tsx:204-214`）。注意 `autoIngest` 是**配置开关名**，与函数 `autoIngest()`（`src/lib/ingest.ts:636`）同名但不同物——P1.2 改的是开关语义，不重命名函数。
+
+**裁决理由**：两层内容模型下，廉价索引**恒为开启**（导入即索引、零 LLM），因此该开关不再可能表达「要不要索引」。它现在只该表达「要不要在导入时自动**合成** wiki 页」——而这正是 §7 P1.2 要改为显式触发的部分。默认关闭使 10K 导入的 LLM 调用数为 0（P1.1 验收门），成本可预测。
+
+**兼容性**：默认值只作用于**新项目**；既有项目的已持久化配置不被改写，故不构成对既有用户的静默行为变更。保留键名不改以避配置迁移churn，改由 UI 文案澄清语义（「导入时自动合成 wiki 页」）。
+
+**归属期次**：默认值翻转属 P1.2（与「合成改显式触发」同批交付），P0 不得引入该行为变更。
