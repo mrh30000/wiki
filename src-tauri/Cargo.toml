@@ -70,6 +70,7 @@ walkdir = "2"
 epub = "2.1.5"
 mobi = "0.8"
 html2text = { version = "0.17.1", default-features = false, features = ["xml"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
