@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
@@ -116,6 +116,57 @@ mod tests {
         assert!(resolved.is_file());
         let _ = fs::remove_dir_all(source);
         let _ = fs::remove_dir_all(destination_dir);
+    }
+
+    #[test]
+    fn rebuild_index_db_recreates_searchable_index_from_disk() {
+        let root = temp("rebuild-index-db");
+        let wiki = root.join("wiki");
+        fs::create_dir_all(&wiki).unwrap();
+        fs::write(wiki.join("a.md"), "# A\n\n灾备集群").unwrap();
+
+        let result = rebuild_index_db_inner(root.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(result.pages, 1);
+
+        // Deleting the DB and rebuilding must yield the same searchable state
+        // (spec invariant 2).
+        let db_path = crate::commands::index_db::index_db_path(root.to_string_lossy().as_ref());
+        fs::remove_file(&db_path).unwrap();
+        let again = rebuild_index_db_inner(root.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(again.pages, 1);
+
+        let db = crate::commands::index_db::IndexDb::open(root.to_string_lossy().as_ref()).unwrap();
+        let hits = db
+            .search_candidates(
+                &crate::commands::segment::build_fts_match_query(&["灾备".to_string()]),
+                50,
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn rebuild_index_db_stamps_schema_version_over_a_stale_value() {
+        let root = temp("rebuild-index-db-stale-version");
+        fs::create_dir_all(root.join("wiki")).unwrap();
+        fs::write(root.join("wiki/a.md"), "# A\n\n灾备集群").unwrap();
+
+        // Simulate the stale version Task 7 self-heals on. `ensure_schema` uses
+        // ON CONFLICT DO NOTHING, so a rebuild that omitted the explicit stamp
+        // would leave this value in place and re-trigger on every search.
+        let db = crate::commands::index_db::IndexDb::open(root.to_string_lossy().as_ref()).unwrap();
+        db.set_schema_version(crate::commands::index_db::INDEX_SCHEMA_VERSION - 1)
+            .unwrap();
+        drop(db);
+
+        rebuild_index_db_inner(root.to_string_lossy().into_owned()).unwrap();
+
+        let db = crate::commands::index_db::IndexDb::open(root.to_string_lossy().as_ref()).unwrap();
+        assert_eq!(
+            db.schema_version().unwrap(),
+            crate::commands::index_db::INDEX_SCHEMA_VERSION
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }
 
@@ -351,5 +402,39 @@ fn rebuild_wiki_index_inner(project_path: String) -> Result<RebuildIndexResult, 
     Ok(RebuildIndexResult {
         pages: count,
         groups: groups.len(),
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RebuildIndexDbResult {
+    pub pages: usize,
+    pub links: usize,
+}
+
+/// Rebuild the derived search index from the plaintext wiki.
+///
+/// Safe to run at any time: the index is a discardable derivative, so this is
+/// both the recovery path (corrupt/missing index.db) and the migration path
+/// (schema version bump).
+#[tauri::command]
+pub async fn rebuild_index_db(project_path: String) -> Result<RebuildIndexDbResult, String> {
+    tauri::async_runtime::spawn_blocking(move || rebuild_index_db_inner(project_path))
+        .await
+        .map_err(|error| format!("Index rebuild task failed: {error}"))?
+}
+
+// `pub(crate)` rather than private: the self-heal path in search.rs calls this
+// directly instead of re-implementing the rebuild.
+pub(crate) fn rebuild_index_db_inner(project_path: String) -> Result<RebuildIndexDbResult, String> {
+    let mut db = crate::commands::index_db::IndexDb::open(&project_path)?;
+    let stats = crate::commands::index_build::build_index(&mut db, &project_path)?;
+    // Stamp the current version AFTER the rebuild. `ensure_schema` uses
+    // ON CONFLICT DO NOTHING, so without this the stale flag would survive the
+    // rebuild and the self-heal check would re-trigger on every search.
+    db.set_schema_version(crate::commands::index_db::INDEX_SCHEMA_VERSION)?;
+    Ok(RebuildIndexDbResult {
+        pages: stats.pages,
+        links: stats.links,
     })
 }

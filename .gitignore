@@ -28,6 +28,9 @@ AGENTS.md
 # Benchmark and test data (local only)
 tests/
 
+# Derived search index (rebuilt from wiki/*.md; see .llm-wiki/index.db)
+.llm-wiki/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
