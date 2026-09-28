@@ -12,4 +12,5 @@ pub mod page_embedding;
 pub mod project;
 pub mod project_maintenance;
 pub mod search;
+pub mod segment;
 pub mod vectorstore;
