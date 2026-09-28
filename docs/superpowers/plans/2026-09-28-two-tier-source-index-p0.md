@@ -228,13 +228,13 @@ impl IndexDb {
         Ok(value.and_then(|v| v.parse().ok()).unwrap_or(0))
     }
 
-    /// Test-only: force a schema version so the migration path is reachable
-    /// without constructing a stale database file by hand.
-    #[cfg(test)]
-    pub(crate) fn set_schema_version_for_test(&self, version: i64) -> Result<(), String> {
+    /// Stamp the schema version. Called after a successful rebuild so the
+    /// stale-version flag actually clears; `ensure_schema` deliberately does
+    /// NOT overwrite an existing version.
+    pub(crate) fn set_schema_version(&self, version: i64) -> Result<(), String> {
         self.conn
             .execute(
-                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                "INSERT INTO meta(key, value) VALUES('schema_version', ?1)\n                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 [version.to_string()],
             )
             .map_err(|e| e.to_string())?;
@@ -319,7 +319,7 @@ concurrent ingest."
 - Produces:
   - `pub fn segment_for_fts(input: &str) -> String`
   - `pub fn build_fts_match_query(tokens: &[String]) -> String`
-  - `pub fn fts_escape_phrase(s: &str) -> String`
+  - `fn fts_escape_phrase(s: &str) -> String`（私有）
 
 - [ ] **Step 1: 注册模块**
 
@@ -356,7 +356,10 @@ pub fn segment_for_fts(input: &str) -> String {
 
 /// Escape a string for use inside an FTS5 double-quoted phrase.
 /// FTS5 escapes a literal `"` by doubling it.
-pub fn fts_escape_phrase(s: &str) -> String {
+///
+/// Private on purpose: nothing outside this module needs it, and a second
+/// escape implementation elsewhere is how FTS5 injection creeps back in.
+fn fts_escape_phrase(s: &str) -> String {
     s.replace('"', "\"\"")
 }
 
@@ -566,23 +569,6 @@ impl IndexDb {
         let mut out = Vec::new();
         for row in rows {
             out.push(row.map_err(|e| format!("读取候选失败: {e}"))?);
-        }
-        Ok(out)
-    }
-
-    pub fn links_from(&self, src_page_id: &str) -> Result<Vec<String>, String> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT dst_raw FROM links WHERE src_page_id = ?1")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([src_page_id], |row| row.get::<_, Option<String>>(0))
-            .map_err(|e| e.to_string())?;
-        let mut out = Vec::new();
-        for row in rows {
-            if let Some(v) = row.map_err(|e| e.to_string())? {
-                out.push(v);
-            }
         }
         Ok(out)
     }
@@ -818,6 +804,7 @@ deleting a Markdown file removes it from search."
 **Files:**
 - Modify: `src-tauri/src/commands/project_maintenance.rs`
 - Modify: `src-tauri/src/lib.rs`
+- Modify: `.gitignore`
 
 **Interfaces:**
 - Consumes: `IndexDb`（Task 1）、`build_index`（Task 3）
@@ -825,6 +812,25 @@ deleting a Markdown file removes it from search."
   - `pub struct RebuildIndexDbResult { pub pages: usize, pub links: usize }`
   - `#[tauri::command] pub async fn rebuild_index_db(project_path: String) -> Result<RebuildIndexDbResult, String>`
   - `fn rebuild_index_db_inner(project_path: String) -> Result<RebuildIndexDbResult, String>`
+
+- [ ] **Step 0: 把索引库加入 `.gitignore`**
+
+本 Task 是第一个真正写出 `.llm-wiki/index.db` 的地方。该文件是派生状态且为 WAL 模式（含 `-wal`/`-shm` 旁文件），**不得进入版本控制**。当前 `.gitignore` 未包含它。
+
+在 `.gitignore` 的 `# Benchmark and test data (local only)` 段附近追加：
+
+```gitignore
+# Derived search index (rebuilt from wiki/*.md; see .llm-wiki/index.db)
+.llm-wiki/
+```
+
+验证：
+
+```bash
+git check-ignore -v .llm-wiki/index.db
+```
+
+Expected: 输出一行匹配 `.llm-wiki/` 的规则（而非无输出）。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -891,6 +897,10 @@ pub async fn rebuild_index_db(project_path: String) -> Result<RebuildIndexDbResu
 fn rebuild_index_db_inner(project_path: String) -> Result<RebuildIndexDbResult, String> {
     let mut db = crate::commands::index_db::IndexDb::open(&project_path)?;
     let stats = crate::commands::index_build::build_index(&mut db, &project_path)?;
+    // Stamp the current version AFTER the rebuild. `ensure_schema` uses
+    // ON CONFLICT DO NOTHING, so without this the stale flag would survive the
+    // rebuild and the self-heal check would re-trigger on every search.
+    db.set_schema_version(crate::commands::index_db::INDEX_SCHEMA_VERSION)?;
     Ok(RebuildIndexDbResult {
         pages: stats.pages,
         links: stats.links,
@@ -919,12 +929,13 @@ Expected: 全部通过（含既有的 `rebuilds_index_from_page_frontmatter`）�
 - [ ] **Step 6: 提交**
 
 ```bash
-git add src-tauri/src/commands/project_maintenance.rs src-tauri/src/lib.rs
+git add src-tauri/src/commands/project_maintenance.rs src-tauri/src/lib.rs .gitignore
 git commit -m "feat(index): add rebuild_index_db command as recovery path
 
 Deleting index.db and rebuilding yields identical searchable state,
 which is the spec's discardability invariant and the schema-migration
-mechanism."
+mechanism. The DB is derived state and WAL-mode, so it is gitignored
+rather than committed."
 ```
 
 ---
@@ -1060,7 +1071,7 @@ Expected: `searches_beyond_ten_thousand_pages` **FAIL**（当前 `MAX_SEARCH_FIL
     // Candidates come from the derived index instead of a full directory walk.
     // BM25 only orders the candidate set for truncation; final ranking stays
     // with score_file/RRF (spec invariant 5).
-    let mut db = IndexDb::open(&project_path)?;
+    let db = IndexDb::open(&project_path)?;
     let match_query = crate::commands::segment::build_fts_match_query(&effective_tokens);
     let mut candidate_paths = db.search_candidates(&match_query, CANDIDATE_LIMIT)?;
     // Always probe the exact phrase too: token expansion can drop a page the
@@ -1273,12 +1284,22 @@ size no longer causes silent misses."
     #[tokio::test]
     async fn stale_schema_version_triggers_rebuild() {
         // Review Focus #2: an index written by an older app version.
+        // Build a POPULATED index first, then mark it stale — otherwise this
+        // test would pass via the empty-index path and never exercise the
+        // schema check at all.
         let root = tmp_project();
         write_page(&root, "wiki/a.md", "# A\n\n灾备集群");
         {
-            let db = crate::commands::index_db::IndexDb::open(root.to_string_lossy().as_ref())
-                .unwrap();
-            db.set_schema_version_for_test(0).unwrap();
+            let mut db =
+                crate::commands::index_db::IndexDb::open(root.to_string_lossy().as_ref())
+                    .unwrap();
+            crate::commands::index_build::build_index(
+                &mut db,
+                root.to_string_lossy().as_ref(),
+            )
+            .unwrap();
+            db.set_schema_version(0).unwrap();
+            assert_eq!(db.page_count().unwrap(), 1, "fixture must be populated");
         }
         let resp = search_project_inner(
             root.to_string_lossy().into_owned(),
@@ -1290,6 +1311,15 @@ size no longer causes silent misses."
         .await
         .unwrap();
         assert!(!resp.results.is_empty(), "stale schema must self-heal");
+        // The rebuild must have cleared the stale flag, or every later search
+        // rebuilds again.
+        let after = crate::commands::index_db::IndexDb::open(root.to_string_lossy().as_ref())
+            .unwrap();
+        assert_eq!(
+            after.schema_version().unwrap(),
+            crate::commands::index_db::INDEX_SCHEMA_VERSION,
+            "rebuild must stamp the current version"
+        );
         let _ = fs::remove_dir_all(root);
     }
 ```
@@ -1301,6 +1331,8 @@ Run: `cd src-tauri && cargo test --lib missing_index_is_rebuilt_not_fatal stale_
 Expected: 至少一个 **FAIL**（缺库时 `search_candidates` 返回空且不会重建）。
 
 - [ ] **Step 3: 实现自愈**
+
+先移除 Task 1 为未使用接口加的 `#[allow(dead_code)]`：`set_schema_version` 自本 Task 起被真实调用，`search.rs` 自本 Task 起消费 `schema_version`/`page_count`，这些属性应逐个删除（`index_db.rs` 中的四处）。保留仍未被使用的（如 `links_from` 若已删除则无）。
 
 在 `search_project_inner` 打开索引处替换为：
 
