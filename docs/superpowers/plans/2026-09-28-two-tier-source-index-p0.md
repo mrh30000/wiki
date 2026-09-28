@@ -410,6 +410,16 @@ mod tests {
             assert!(q.starts_with('"') && q.ends_with('"'), "unquoted: {q}");
             assert_eq!(q.matches('"').count() % 2, 0, "unbalanced quotes: {q}");
         }
+
+        // The two structural assertions above CANNOT detect a broken escaper:
+        // an unescaped `he said "hi"` yields `"he said "hi""` — 4 quotes
+        // (even) and still starts/ends with a quote. So pin the exact escaped
+        // output too, or removing the escaping would pass this test silently.
+        assert_eq!(
+            build_fts_match_query(&["he said \"hi\"".to_string()]),
+            "\"he said \"\"hi\"\"\""
+        );
+        assert_eq!(build_fts_match_query(&["\"".to_string()]), "\"\"\"\"");
     }
 
     #[test]
