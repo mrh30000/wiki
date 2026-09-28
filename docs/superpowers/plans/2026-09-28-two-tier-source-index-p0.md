@@ -69,7 +69,7 @@
   - `pub fn index_db_path(project_path: &str) -> std::path::PathBuf`
   - `impl IndexDb { pub fn open(project_path: &str) -> Result<IndexDb, String>; pub fn open_in_memory() -> Result<IndexDb, String>; pub fn ensure_schema(&self) -> Result<(), String>; pub fn schema_version(&self) -> Result<i64, String>; }`
 
-- [ ] **Step 1: 添加依赖**
+- [x] **Step 1: 添加依赖**
 
 ```bash
 cd src-tauri && cargo add rusqlite --features bundled
@@ -77,7 +77,7 @@ cd src-tauri && cargo add rusqlite --features bundled
 
 Expected: `Cargo.toml` 的 `[dependencies]` 出现 `rusqlite = { version = "...", features = ["bundled"] }`。
 
-- [ ] **Step 2: 注册模块**
+- [x] **Step 2: 注册模块**
 
 在 `src-tauri/src/commands/mod.rs` 按字母序插入（现有 `pub mod fs;` 与 `pub mod page_embedding;` 之间）：
 
@@ -85,7 +85,7 @@ Expected: `Cargo.toml` 的 `[dependencies]` 出现 `rusqlite = { version = "..."
 pub mod index_db;
 ```
 
-- [ ] **Step 3: 写失败测试（FTS5 可用性 + schema 幂等）**
+- [x] **Step 3: 写失败测试（FTS5 可用性 + schema 幂等）**
 
 创建 `src-tauri/src/commands/index_db.rs`，**仅**写入测试与最小骨架：
 
@@ -276,7 +276,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: 运行测试，确认 FTS5 可用**
+- [x] **Step 4: 运行测试，确认 FTS5 可用**
 
 Run: `cd src-tauri && cargo test --lib index_db -- --nocapture`
 
@@ -290,7 +290,7 @@ cd src-tauri && cargo add rusqlite --features bundled-full
 
 然后重跑本步。**不得**在没有通过此测试的情况下继续。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/src/commands/mod.rs src-tauri/src/commands/index_db.rs
@@ -321,7 +321,7 @@ concurrent ingest."
   - `pub fn build_fts_match_query(tokens: &[String]) -> String`
   - `fn fts_escape_phrase(s: &str) -> String`（私有）
 
-- [ ] **Step 1: 注册模块**
+- [x] **Step 1: 注册模块**
 
 在 `src-tauri/src/commands/mod.rs` 按字母序插入：
 
@@ -329,7 +329,7 @@ concurrent ingest."
 pub mod segment;
 ```
 
-- [ ] **Step 2: 写失败测试**
+- [x] **Step 2: 写失败测试**
 
 创建 `src-tauri/src/commands/segment.rs`：
 
@@ -439,13 +439,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: 运行测试，确认失败**
+- [x] **Step 3: 运行测试，确认失败**
 
 Run: `cd src-tauri && cargo test --lib segment`
 
 Expected: 编译失败，因为 `search::tokenize_query` 可能需要提升可见性（见 Step 4），或测试断言失败。记录实际错误。
 
-- [ ] **Step 4: 满足编译需求（最小实现）**
+- [x] **Step 4: 满足编译需求（最小实现）**
 
 若报 `function tokenize_query is private`，在 `search.rs:995` 将其签名改为：
 
@@ -455,13 +455,13 @@ pub fn tokenize_query(query: &str) -> Vec<String> {
 
 **只改可见性，不改函数体。** 若报 `is_query_separator`/`is_stop_word` 私有，同样只加 `pub`。
 
-- [ ] **Step 5: 运行测试，确认通过**
+- [x] **Step 5: 运行测试，确认通过**
 
 Run: `cd src-tauri && cargo test --lib segment`
 
 Expected: 5 个测试全部 **PASS**。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add src-tauri/src/commands/mod.rs src-tauri/src/commands/segment.rs src-tauri/src/commands/search.rs
@@ -490,7 +490,7 @@ characters in user input stay literal."
   - `impl IndexDb { pub fn replace_all(&mut self, pages: &[IndexPage]) -> Result<(), String>; }`
   - `pub struct IndexPage { pub path: String, pub title: String, pub page_type: String, pub hash: String, pub mtime: i64, pub body_raw: String, pub links: Vec<String> }`
 
-- [ ] **Step 1: 在 `index_db.rs` 增加写入接口**
+- [x] **Step 1: 在 `index_db.rs` 增加写入接口**
 
 追加到 `impl IndexDb`（`SCHEMA_SQL` 之后定义 `IndexPage`）：
 
@@ -585,7 +585,7 @@ impl IndexDb {
 }
 ```
 
-- [ ] **Step 2: 写失败测试**
+- [x] **Step 2: 写失败测试**
 
 创建 `src-tauri/src/commands/index_build.rs`：
 
@@ -758,7 +758,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: 补齐 `index_db.rs` 中测试用到的 `page_count`**
+- [x] **Step 3: 补齐 `index_db.rs` 中测试用到的 `page_count`**
 
 追加到 `impl IndexDb`：
 
@@ -772,13 +772,13 @@ mod tests {
     }
 ```
 
-- [ ] **Step 4: 运行测试，确认失败**
+- [x] **Step 4: 运行测试，确认失败**
 
 Run: `cd src-tauri && cargo test --lib index_build`
 
 Expected: 编译失败（`extract_page_type` 不存在，或 `extract_title`/`extract_graph_links` 私有）。
 
-- [ ] **Step 5: 满足编译需求**
+- [x] **Step 5: 满足编译需求**
 
 - `extract_title`：已是 `pub`，无需改动。
 - `extract_graph_links`：已是 `pub(crate)`（`search.rs:707`），`index_build` 同 crate 可直接调用，**无需改动**。
@@ -790,13 +790,13 @@ pub(crate) fn frontmatter_value(content: &str, key: &str) -> Option<String> {
 
   **只改可见性，不改函数体**——它与 `rebuild_wiki_index_inner` 必须对 frontmatter 保持同一解析语义。
 
-- [ ] **Step 6: 运行测试，确认通过**
+- [x] **Step 6: 运行测试，确认通过**
 
 Run: `cd src-tauri && cargo test --lib index_build`
 
 Expected: 3 个测试 **PASS**。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 git add src-tauri/src/commands/mod.rs src-tauri/src/commands/index_db.rs src-tauri/src/commands/index_build.rs src-tauri/src/commands/search.rs
@@ -823,7 +823,7 @@ deleting a Markdown file removes it from search."
   - `#[tauri::command] pub async fn rebuild_index_db(project_path: String) -> Result<RebuildIndexDbResult, String>`
   - `fn rebuild_index_db_inner(project_path: String) -> Result<RebuildIndexDbResult, String>`
 
-- [ ] **Step 0: 把索引库加入 `.gitignore`**
+- [x] **Step 0: 把索引库加入 `.gitignore`**
 
 本 Task 是第一个真正写出 `.llm-wiki/index.db` 的地方。该文件是派生状态且为 WAL 模式（含 `-wal`/`-shm` 旁文件），**不得进入版本控制**。当前 `.gitignore` 未包含它。
 
@@ -842,7 +842,7 @@ git check-ignore -v .llm-wiki/index.db
 
 Expected: 输出一行匹配 `.llm-wiki/` 的规则（而非无输出）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `project_maintenance.rs` 的 `#[cfg(test)] mod tests` 中追加：
 
@@ -874,13 +874,13 @@ Expected: 输出一行匹配 `.llm-wiki/` 的规则（而非无输出）。
     }
 ```
 
-- [ ] **Step 2: 运行测试，确认失败**
+- [x] **Step 2: 运行测试，确认失败**
 
 Run: `cd src-tauri && cargo test --lib rebuild_index_db`
 
 Expected: 编译失败，`rebuild_index_db_inner` 未定义。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 追加到 `project_maintenance.rs`：
 
@@ -924,19 +924,19 @@ fn rebuild_index_db_inner(project_path: String) -> Result<RebuildIndexDbResult, 
             commands::project_maintenance::rebuild_index_db,
 ```
 
-- [ ] **Step 4: 运行测试，确认通过**
+- [x] **Step 4: 运行测试，确认通过**
 
 Run: `cd src-tauri && cargo test --lib rebuild_index_db`
 
 Expected: **PASS**。
 
-- [ ] **Step 5: 全量回归**
+- [x] **Step 5: 全量回归**
 
 Run: `cd src-tauri && cargo test --lib`
 
 Expected: 全部通过（含既有的 `rebuilds_index_from_page_frontmatter`）。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add src-tauri/src/commands/project_maintenance.rs src-tauri/src/lib.rs .gitignore
@@ -961,7 +961,7 @@ rather than committed."
 - Consumes: `IndexDb::search_candidates`（Task 1）、`build_fts_match_query`（Task 2）
 - Produces: 无新公开接口；`search_project_inner` 的签名与返回类型**不变**。
 
-- [ ] **Step 1: 写失败测试（断崖 + 召回）**
+- [x] **Step 1: 写失败测试（断崖 + 召回）**
 
 在 `search.rs` 的 `#[cfg(test)] mod tests` 追加（该模块**已有** `tmp_project()` 与 `write_page()` 辅助函数，直接用；`search.rs` 的既有测试已用 `#[tokio::test]`，保持一致）。注意 `search_project_inner` 是 async，必须用 `#[tokio::test]` + `.await`，**不要**用 `block_on`：
 
@@ -1129,7 +1129,7 @@ rather than committed."
     }
 ```
 
-- [ ] **Step 2: 运行测试，确认失败**
+- [x] **Step 2: 运行测试，确认失败**
 
 Run: `cd src-tauri && cargo test --lib searches_beyond_ten_thousand_pages two_character_cjk_query_matches candidate_recall_matches_full_scan`
 
@@ -1137,7 +1137,7 @@ Expected: `searches_beyond_ten_thousand_pages` **FAIL**（当前 `MAX_SEARCH_FIL
 
 **重要（前置条件）**：本 Task 的自愈块使既有测试（它们只写 Markdown、从不建索引）自动受益；若无它，`search.rs` 中 4 个既有 `search_project_inner` 测试会因空索引而失败。本 Task 的 Step 3 已包含自愈块，**不得**省略。
 
-- [ ] **Step 3: 替换候选生成段**
+- [x] **Step 3: 替换候选生成段**
 
 将 `search.rs:350-417`（从 `let wiki_root = ...` 到该 `if` 块结束的 `}`）**整块**替换为下面代码。这是完整替换内容，不是片段：
 
@@ -1247,13 +1247,13 @@ use crate::commands::index_db::{IndexDb, INDEX_SCHEMA_VERSION};
 
 **注意**：`graph_pages` 的构建原先依赖遍历到的全部文件；现在只覆盖候选页。图谱扩展因此可能变浅——这是可接受的 P0 降级（P2.2 会用 `links` 表补回）。但**必须**在 Step 5 的注释中写明，不得静默。
 
-- [ ] **Step 4: 运行测试，确认通过**
+- [x] **Step 4: 运行测试，确认通过**
 
 Run: `cd src-tauri && cargo test --lib`
 
 Expected: 全部 **PASS**，含既有的 `tokenizes_cjk_bigrams_and_chars` 等。
 
-- [ ] **Step 5: 记录图谱降级**
+- [x] **Step 5: 记录图谱降级**
 
 在 `search_project_inner` 中 `graph_pages` 构建处加注释：
 
@@ -1263,7 +1263,7 @@ Expected: 全部 **PASS**，含既有的 `tokenizes_cjk_bigrams_and_chars` 等�
             // restores depth by reading the `links` table.
 ```
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add src-tauri/src/commands/search.rs
@@ -1295,7 +1295,7 @@ Known P0 limitation: graph expansion now sees only candidates."
 - Consumes: Task 5 的候选生成
 - Produces: 无
 
-- [ ] **Step 1: 确认候选生成截断已移除，并重命名常量**
+- [x] **Step 1: 确认候选生成截断已移除，并重命名常量**
 
 先确认只剩一处使用：
 
@@ -1314,19 +1314,19 @@ const MAX_GRAPH_PAGES: usize = 10_000;
 
 并把 `search.rs:184` 的 `MAX_SEARCH_FILES` 改为 `MAX_GRAPH_PAGES`。
 
-- [ ] **Step 2: 确认无残留引用**
+- [x] **Step 2: 确认无残留引用**
 
 Run: `grep -rn "MAX_SEARCH_FILES" src-tauri/src || echo "removed"`
 
 Expected: `removed`
 
-- [ ] **Step 3: 运行全量回归**
+- [x] **Step 3: 运行全量回归**
 
 Run: `cd src-tauri && cargo test --lib`
 
 Expected: 全部 **PASS**（除 7 个既有的 Windows 路径失败），特别是 Task 5 的 `searches_beyond_ten_thousand_pages` 与 `missing_index_is_rebuilt_not_fatal`。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 git add src-tauri/src/commands/search.rs
@@ -1352,7 +1352,7 @@ it actually caps. That graph cliff is P2.2 scope, not P0."
 - Consumes: 无
 - Produces: 无新公开接口
 
-- [ ] **Step 1: 移除已无必要的 `#[allow(dead_code)]`**
+- [x] **Step 1: 移除已无必要的 `#[allow(dead_code)]`**
 
 Task 1 在 `index_db.rs` 加了四处 `#[allow(dead_code)]`，Task 3 在 `index_build.rs` 的 `BuildStats.skipped` 上加了一处，都是因为当时接口尚未被消费。现在 `open`/`apply_pragmas`/`schema_version`/`page_count`/`set_schema_version` 均已被 Task 4/5 真实使用。
 
@@ -1362,7 +1362,7 @@ Run: `cd src-tauri && cargo build --lib 2>&1 | grep -A3 "never used\|dead_code"`
 
 Expected: 对每个仍报 `never used` 的项，**说明它确实仍未被使用**——此时才保留该处 `#[allow(dead_code)]`，并在其上写一行注释说明为何保留（而不是为了消警告而盲目加回）。不得出现新的警告堆积。
 
-- [ ] **Step 2: 删除 `BuildStats.skipped`（YAGNI）**
+- [x] **Step 2: 删除 `BuildStats.skipped`（YAGNI）**
 
 `skipped` 恒为 `0` 且 P0 中无任何读取方（`RebuildIndexDbResult` 只取 `pages`/`links`）。一个永远是 0、无人读的字段加上它的 `#[allow]` 是纯噪音。
 
@@ -1372,7 +1372,7 @@ Run: `cd src-tauri && cargo build --lib`
 
 Expected: 编译通过，且 `index_build.rs` 中不再有 `#[allow(dead_code)]`。
 
-- [ ] **Step 3: 修正文档（E13：文档与代码不符）**
+- [x] **Step 3: 修正文档（E13：文档与代码不符）**
 
 `README_CN.md:208` 与 `README_CN.md:212` 当前声称「同时搜索 wiki/ 和 raw/sources/」与「快速 ANN 检索」，与代码证据不符。改为准确描述：
 
@@ -1381,7 +1381,7 @@ Expected: 编译通过，且 `index_build.rs` 中不再有 `#[allow(dead_code)]`
 
 同时可补一句说明 `.llm-wiki/index.db` 是磁盘 Markdown 的派生物，可删除后自动重建——这是用户可见的重要事实。
 
-- [ ] **Step 4: 全量回归并提交**
+- [x] **Step 4: 全量回归并提交**
 
 Run: `cd src-tauri && cargo test --lib`
 
@@ -1408,13 +1408,13 @@ derivative of the Markdown."
 ---
 ## 完成标准（P0）
 
-- [ ] `cargo test --lib` 全绿，含新增的断崖、二字词、召回、自愈测试。
-- [ ] `grep -rn "MAX_SEARCH_FILES" src-tauri/src` 为空。
-- [ ] 删除 `.llm-wiki/index.db` 后检索仍可用（自动重建）。
-- [ ] 10,050 页 fixture 下第 10,001 个之后的页面可被检索命中。
-- [ ] 中文二字词（`巡检`、`灾备`）可命中。
-- [ ] `score_file`、`tokenize_query`、RRF 常量与算法**未被修改语义**（`git diff` 复核）。
-- [ ] `cargo clippy -- -D warnings` 无新增告警。
+- [x] `cargo test --lib` 全绿，含新增的断崖、二字词、召回、自愈测试。
+- [x] `grep -rn "MAX_SEARCH_FILES" src-tauri/src` 为空。
+- [x] 删除 `.llm-wiki/index.db` 后检索仍可用（自动重建）。
+- [x] 10,050 页 fixture 下第 10,001 个之后的页面可被检索命中。
+- [x] 中文二字词（`巡检`、`灾备`）可命中。
+- [x] `score_file`、`tokenize_query`、RRF 常量与算法**未被修改语义**（`git diff` 复核）。
+- [x] `cargo clippy -- -D warnings` 无新增告警。
 
 ## 后续计划（不在本计划内）
 
