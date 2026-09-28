@@ -486,7 +486,7 @@ characters in user input stay literal."
 - Consumes: `IndexDb`（Task 1）、`segment_for_fts`（Task 2）、`search::extract_graph_links`（已存在）
 - Produces:
   - `pub struct BuildStats { pub pages: usize, pub links: usize, pub skipped: usize }`
-  - `pub fn build_index(db: &IndexDb, project_path: &str) -> Result<BuildStats, String>`
+  - `pub fn build_index(db: &mut IndexDb, project_path: &str) -> Result<BuildStats, String>`
   - `impl IndexDb { pub fn replace_all(&mut self, pages: &[IndexPage]) -> Result<(), String>; }`
   - `pub struct IndexPage { pub path: String, pub title: String, pub page_type: String, pub hash: String, pub mtime: i64, pub body_raw: String, pub links: Vec<String> }`
 
