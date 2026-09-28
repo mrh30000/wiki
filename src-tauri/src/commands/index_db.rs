@@ -67,6 +67,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(
 );
 "#;
 
+pub struct IndexPage {
+    pub path: String,
+    pub title: String,
+    pub page_type: String,
+    pub hash: String,
+    pub mtime: i64,
+    pub body_raw: String,
+    pub links: Vec<String>,
+}
+
 pub struct IndexDb {
     conn: Connection,
 }
@@ -155,11 +165,99 @@ impl IndexDb {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    /// Replace the entire index in one transaction. Callers must have already
+    /// written the Markdown to disk — the index is a derivative.
+    pub fn replace_all(&mut self, pages: &[IndexPage]) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("无法开启索引事务: {e}"))?;
+        tx.execute("DELETE FROM pages_fts", [])
+            .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM pages", []).map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM links", []).map_err(|e| e.to_string())?;
+        for page in pages {
+            tx.execute(
+                "INSERT INTO pages(id, path, title, type, hash, mtime, frontmatter)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+                rusqlite::params![
+                    page.path,
+                    page.path,
+                    page.title,
+                    page.page_type,
+                    page.hash,
+                    page.mtime
+                ],
+            )
+            .map_err(|e| format!("写入 page 失败 ({}): {e}", page.path))?;
+            // Indexed text goes through the same segmenter the query side uses;
+            // asymmetric use fails silently (no match, no error).
+            let segmented_title = crate::commands::segment::segment_for_fts(&page.title);
+            let segmented_body = crate::commands::segment::segment_for_fts(&page.body_raw);
+            tx.execute(
+                "INSERT INTO pages_fts(title, body, heading_path, page_id, body_raw)
+                 VALUES(?1, ?2, '', ?3, ?4)",
+                rusqlite::params![
+                    segmented_title,
+                    segmented_body,
+                    page.path,
+                    page.body_raw
+                ],
+            )
+            .map_err(|e| format!("写入 FTS 失败 ({}): {e}", page.path))?;
+            for dst in &page.links {
+                tx.execute(
+                    "INSERT INTO links(src_page_id, dst_page_id, dst_raw, weight)
+                     VALUES(?1, NULL, ?2, 1.0)",
+                    rusqlite::params![page.path, dst],
+                )
+                .map_err(|e| format!("写入 link 失败: {e}"))?;
+            }
+        }
+        tx.commit().map_err(|e| format!("提交索引事务失败: {e}"))?;
+        Ok(())
+    }
+
+    /// FTS5 candidate generation. Returns project-relative page paths.
+    pub fn search_candidates(&self, match_query: &str, limit: usize) -> Result<Vec<String>, String> {
+        if match_query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT page_id FROM pages_fts
+                 WHERE pages_fts MATCH ?1
+                 ORDER BY bm25(pages_fts)
+                 LIMIT ?2",
+            )
+            .map_err(|e| format!("准备候选查询失败: {e}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![match_query, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| format!("执行候选查询失败: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("读取候选失败: {e}"))?);
+        }
+        Ok(out)
+    }
+
+    pub fn page_count(&self) -> Result<usize, String> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM pages", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        Ok(n as usize)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::segment::segment_for_fts;
 
     #[test]
     fn fts5_is_available_in_bundled_sqlite() {
@@ -180,6 +278,42 @@ mod tests {
             )
             .expect("FTS5 MATCH should work");
         assert_eq!(hits, 1);
+    }
+
+    /// The write side must store the SEGMENTED text: unicode61 treats a run of
+    /// CJK as one token, so an unsegmented body silently never matches the
+    /// segmented query. Pinning the stored text guards that invariant.
+    #[test]
+    fn replace_all_stores_segmented_fts_text_and_raw_body() {
+        let mut db = IndexDb::open_in_memory().unwrap();
+        db.replace_all(&[IndexPage {
+            path: "wiki/a.md".to_string(),
+            title: "灾备".to_string(),
+            page_type: "concept".to_string(),
+            hash: "h".to_string(),
+            mtime: 1,
+            body_raw: "灾备集群".to_string(),
+            links: vec!["wiki/b.md".to_string()],
+        }])
+        .unwrap();
+
+        let (title, body, body_raw): (String, String, String) = db
+            .conn
+            .query_row(
+                "SELECT title, body, body_raw FROM pages_fts WHERE page_id = 'wiki/a.md'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(title, segment_for_fts("灾备"));
+        assert_eq!(body, segment_for_fts("灾备集群"));
+        assert_eq!(body_raw, "灾备集群", "body_raw keeps the original for display");
+        assert_eq!(db.page_count().unwrap(), 1);
+        let link_count: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM links", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(link_count, 1);
     }
 
     #[test]

@@ -273,7 +273,7 @@ pub struct RebuildIndexResult {
     pub groups: usize,
 }
 
-fn frontmatter_value(content: &str, key: &str) -> Option<String> {
+pub(crate) fn frontmatter_value(content: &str, key: &str) -> Option<String> {
     let normalized = content.replace("\r\n", "\n");
     let body = normalized.strip_prefix("---\n")?.split_once("\n---")?.0;
     body.lines()
