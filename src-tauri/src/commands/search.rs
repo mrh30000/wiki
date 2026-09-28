@@ -21,7 +21,10 @@ const TITLE_TOKEN_WEIGHT: f64 = 5.0;
 const CONTENT_TOKEN_WEIGHT: f64 = 1.0;
 const SNIPPET_CONTEXT: usize = 80;
 const SEARCH_EMBEDDING_TIMEOUT_SECS: u64 = 8;
-const MAX_SEARCH_FILES: usize = 10_000;
+/// Upper bound on pages enumerated by the graph link path. NOTE: this is a
+/// graph-path cap only — search candidates are bounded by CANDIDATE_LIMIT in
+/// search_project_inner. The graph path's own cliff is P2.2 scope.
+const MAX_GRAPH_PAGES: usize = 10_000;
 /// Upper bound on pages handed to the scorer. This bounds memory and IO per
 /// query; it is NOT a silent truncation of the corpus, because candidates are
 /// selected by relevance rather than by directory order.
@@ -186,7 +189,7 @@ fn get_page_links_inner(project_path: &str, file_path: &str) -> Result<PageLinks
     let mut pages = BTreeMap::<String, GraphPage>::new();
     let canonical_project = project.to_string_lossy();
     for entry in WalkDir::new(&wiki_root).into_iter().filter_map(Result::ok) {
-        if pages.len() >= MAX_SEARCH_FILES
+        if pages.len() >= MAX_GRAPH_PAGES
             || !entry.file_type().is_file()
             || entry.path().extension().and_then(|value| value.to_str()) != Some("md")
         {
@@ -2493,7 +2496,7 @@ mod tests {
     async fn searches_beyond_ten_thousand_pages() {
         let root = tmp_project();
         index_fixture(&root, 10_050);
-        // The needle sits past the old MAX_SEARCH_FILES boundary.
+        // The needle sits past the old 10,000-file boundary.
         fs::write(
             root.join("wiki/bulk/zz_needle.md"),
             "# Needle\n\n唯一标记词 逆向工程\n",
