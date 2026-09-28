@@ -1065,6 +1065,68 @@ rather than committed."
             "every matching page must be a candidate"
         );
     }
+    #[tokio::test]
+    async fn missing_index_is_rebuilt_not_fatal() {
+        // Review Focus #2.
+        let root = tmp_project();
+        write_page(&root, "wiki/a.md", "# A\n\n灾备集群");
+        let db_path = crate::commands::index_db::index_db_path(root.to_string_lossy().as_ref());
+        let _ = fs::remove_file(&db_path);
+
+        let resp = search_project_inner(
+            root.to_string_lossy().into_owned(),
+            "灾备".to_string(),
+            20,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!resp.results.is_empty(), "missing index must self-heal");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn stale_schema_version_triggers_rebuild() {
+        // Review Focus #2: an index written by an older app version.
+        // Build a POPULATED index first, then mark it stale — otherwise this
+        // test would pass via the empty-index path and never exercise the
+        // schema check at all.
+        let root = tmp_project();
+        write_page(&root, "wiki/a.md", "# A\n\n灾备集群");
+        {
+            let mut db =
+                crate::commands::index_db::IndexDb::open(root.to_string_lossy().as_ref())
+                    .unwrap();
+            crate::commands::index_build::build_index(
+                &mut db,
+                root.to_string_lossy().as_ref(),
+            )
+            .unwrap();
+            db.set_schema_version(0).unwrap();
+            assert_eq!(db.page_count().unwrap(), 1, "fixture must be populated");
+        }
+        let resp = search_project_inner(
+            root.to_string_lossy().into_owned(),
+            "灾备".to_string(),
+            20,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!resp.results.is_empty(), "stale schema must self-heal");
+        // The rebuild must have cleared the stale flag, or every later search
+        // rebuilds again.
+        let after = crate::commands::index_db::IndexDb::open(root.to_string_lossy().as_ref())
+            .unwrap();
+        assert_eq!(
+            after.schema_version().unwrap(),
+            crate::commands::index_db::INDEX_SCHEMA_VERSION,
+            "rebuild must stamp the current version"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 ```
 
 - [ ] **Step 2: 运行测试，确认失败**
@@ -1072,6 +1134,8 @@ rather than committed."
 Run: `cd src-tauri && cargo test --lib searches_beyond_ten_thousand_pages two_character_cjk_query_matches candidate_recall_matches_full_scan`
 
 Expected: `searches_beyond_ten_thousand_pages` **FAIL**（当前 `MAX_SEARCH_FILES` 截断）；其余两个可能因索引未接线而失败。
+
+**重要（前置条件）**：本 Task 的自愈块使既有测试（它们只写 Markdown、从不建索引）自动受益；若无它，`search.rs` 中 4 个既有 `search_project_inner` 测试会因空索引而失败。本 Task 的 Step 3 已包含自愈块，**不得**省略。
 
 - [ ] **Step 3: 替换候选生成段**
 
@@ -1081,7 +1145,22 @@ Expected: `searches_beyond_ten_thousand_pages` **FAIL**（当前 `MAX_SEARCH_FIL
     // Candidates come from the derived index instead of a full directory walk.
     // BM25 only orders the candidate set for truncation; final ranking stays
     // with score_file/RRF (spec invariant 5).
-    let db = IndexDb::open(&project_path)?;
+    //
+    // Self-heal: the index is a discardable derivative, so a missing, empty,
+    // or stale index is rebuilt rather than surfaced as an error
+    // (spec invariant 2, Review Focus #2). This MUST ship in the same task
+    // that makes the index the mandatory candidate source — without it, every
+    // existing project that has no index.db yet would silently return zero
+    // results, and the pre-existing search tests (which never build an index)
+    // would all fail.
+    let mut db = IndexDb::open(&project_path)?;
+    let stale = db.schema_version().unwrap_or(0) != INDEX_SCHEMA_VERSION;
+    if stale || db.page_count().unwrap_or(0) == 0 {
+        let _ = crate::commands::project_maintenance::rebuild_index_db_inner(
+            project_path.clone(),
+        );
+        db = IndexDb::open(&project_path)?;
+    }
     let match_query = crate::commands::segment::build_fts_match_query(&effective_tokens);
     let mut candidate_paths = db.search_candidates(&match_query, CANDIDATE_LIMIT)?;
     // Always probe the exact phrase too: token expansion can drop a page the
@@ -1161,7 +1240,7 @@ const CANDIDATE_LIMIT: usize = 2_000;
 在文件顶部 `use` 区新增：
 
 ```rust
-use crate::commands::index_db::IndexDb;
+use crate::commands::index_db::{IndexDb, INDEX_SCHEMA_VERSION};
 ```
 
 `WalkDir` 的 `use` **保留**：`search.rs` 其它位置可能仍在用（Task 6 的 clippy 步骤会暴露未使用告警，届时再删）。
@@ -1200,35 +1279,42 @@ Known P0 limitation: graph expansion now sees only candidates."
 
 ---
 
-### Task 6: 删除 `MAX_SEARCH_FILES` 断崖并锁定回归
+### Task 6: 重命名 `MAX_SEARCH_FILES` 并锁定回归
+
+**注意（已修正的前置条件）**：`MAX_SEARCH_FILES` 在 `search.rs:184` 的 `get_page_links_inner` 中**仍有第二个用途**（图谱路径的页数上限）。因此本 Task **不删除**该常量，而是：
+
+1. 确认候选生成处的截断已由 Task 5 移除（`grep` 应只剩 `:184` 一处使用）。
+2. 将常量重命名为 `MAX_GRAPH_PAGES` 以反映其仅存的图谱用途（`get_page_links_inner` 是独立的图谱路径断崖，属 P2.2 范围，P0 不动）。
+
+删除整个常量会破坏 `get_page_links_inner` 的编译——那不在 P0 范围内。
 
 **Files:**
-- Modify: `src-tauri/src/commands/search.rs:23`
+- Modify: `src-tauri/src/commands/search.rs:23`、`search.rs:184`
 
 **Interfaces:**
 - Consumes: Task 5 的候选生成
 - Produces: 无
 
-- [ ] **Step 1: 删除截断分支（常量已由 Task 5 一并删除）**
+- [ ] **Step 1: 确认候选生成截断已移除，并重命名常量**
 
-若 Task 5 已整体替换该循环，此处应已无残留。用 `grep` 确认；仅当仍存在时删除 `search.rs:23`：
+先确认只剩一处使用：
+
+Run: `grep -n "MAX_SEARCH_FILES" src-tauri/src/commands/search.rs`
+
+Expected: 仅剩 `:23`（定义）与 `:184`（`get_page_links_inner`）。若仍见 `searched_files`/截断块，说明 Task 5 未完成，停下来报告。
+
+然后重命名（只改名字，不改 `10_000` 的值，也不改 `:184` 的行为）：
 
 ```rust
-const MAX_SEARCH_FILES: usize = 10_000;
+/// Upper bound on pages enumerated by the graph link path. NOTE: this is a
+/// graph-path cap only — search candidates are bounded by CANDIDATE_LIMIT in
+/// search_project_inner. The graph path's own cliff is P2.2 scope.
+const MAX_GRAPH_PAGES: usize = 10_000;
 ```
 
-以及截断块：
+并把 `search.rs:184` 的 `MAX_SEARCH_FILES` 改为 `MAX_GRAPH_PAGES`。
 
-```rust
-            if searched_files > MAX_SEARCH_FILES {
-                eprintln!(
-                    "[Search] stopped scanning wiki after {MAX_SEARCH_FILES} markdown files in {project_path}"
-                );
-                break;
-            }
-```
-
-- [ ] **Step 2: 确认无残留**
+- [ ] **Step 2: 确认无残留引用**
 
 Run: `grep -rn "MAX_SEARCH_FILES" src-tauri/src || echo "removed"`
 
@@ -1238,156 +1324,88 @@ Expected: `removed`
 
 Run: `cd src-tauri && cargo test --lib`
 
-Expected: 全部 **PASS**，特别是 Task 5 的 `searches_beyond_ten_thousand_pages`。
+Expected: 全部 **PASS**（除 7 个既有的 Windows 路径失败），特别是 Task 5 的 `searches_beyond_ten_thousand_pages` 与 `missing_index_is_rebuilt_not_fatal`。
 
 - [ ] **Step 4: 提交**
 
 ```bash
 git add src-tauri/src/commands/search.rs
-git commit -m "fix(search): remove the 10000-file silent truncation
+git commit -m "refactor(search): rename MAX_SEARCH_FILES to MAX_GRAPH_PAGES
 
-MAX_SEARCH_FILES made search quietly return nothing for corpora past
-10k pages, with only a stderr note. Candidates are now bounded by
-relevance (CANDIDATE_LIMIT) rather than by directory order, so corpus
-size no longer causes silent misses."
+The search-path truncation is gone (candidates are now bounded by
+relevance via CANDIDATE_LIMIT). The constant's only remaining use is
+the graph link path in get_page_links_inner, so the name now says what
+it actually caps. That graph cliff is P2.2 scope, not P0."
 ```
 
 ---
 
-### Task 7: 启动迁移、降级路径与文档修正
+### Task 7: 清理死代码标记与文档修正
+
+**说明**：原 Task 7 的自愈实现与其两个测试（`missing_index_is_rebuilt_not_fatal`、`stale_schema_version_triggers_rebuild`）已在 **Task 5** 交付——因为 Task 5 才是让索引成为必需候选来源的那一步，恢复路径必须与之同批，否则中间态会让无索引的既有项目静默返回空结果。因此本 Task 只剩清理与文档两件事。
 
 **Files:**
-- Modify: `src-tauri/src/commands/search.rs`（降级分支）
+- Modify: `src-tauri/src/commands/index_db.rs`、`index_build.rs`（仅属性/字段清理）
 - Modify: `README_CN.md:208`、`README_CN.md:212`
-- Test: `src-tauri/src/commands/search.rs`（测试模块）
 
 **Interfaces:**
-- Consumes: `IndexDb::schema_version`（Task 1）、`rebuild_index_db_inner`（Task 4）
+- Consumes: 无
 - Produces: 无新公开接口
 
-- [ ] **Step 1: 写失败测试（缺库与版本落后）**
+- [ ] **Step 1: 移除已无必要的 `#[allow(dead_code)]`**
 
-追加到 `search.rs` 测试模块（同上：直接用已有的 `tmp_project()` / `write_page()`，并保持 `#[tokio::test]` 约定）：
+Task 1 在 `index_db.rs` 加了四处 `#[allow(dead_code)]`，Task 3 在 `index_build.rs` 的 `BuildStats.skipped` 上加了一处，都是因为当时接口尚未被消费。现在 `open`/`apply_pragmas`/`schema_version`/`page_count`/`set_schema_version` 均已被 Task 4/5 真实使用。
 
-```rust
-    #[tokio::test]
-    async fn missing_index_is_rebuilt_not_fatal() {
-        // Review Focus #2.
-        let root = tmp_project();
-        write_page(&root, "wiki/a.md", "# A\n\n灾备集群");
-        let db_path = crate::commands::index_db::index_db_path(root.to_string_lossy().as_ref());
-        let _ = fs::remove_file(&db_path);
+**逐个**删除这些属性，然后：
 
-        let resp = search_project_inner(
-            root.to_string_lossy().into_owned(),
-            "灾备".to_string(),
-            20,
-            false,
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(!resp.results.is_empty(), "missing index must self-heal");
-        let _ = fs::remove_dir_all(root);
-    }
+Run: `cd src-tauri && cargo build --lib 2>&1 | grep -A3 "never used\|dead_code"`
 
-    #[tokio::test]
-    async fn stale_schema_version_triggers_rebuild() {
-        // Review Focus #2: an index written by an older app version.
-        // Build a POPULATED index first, then mark it stale — otherwise this
-        // test would pass via the empty-index path and never exercise the
-        // schema check at all.
-        let root = tmp_project();
-        write_page(&root, "wiki/a.md", "# A\n\n灾备集群");
-        {
-            let mut db =
-                crate::commands::index_db::IndexDb::open(root.to_string_lossy().as_ref())
-                    .unwrap();
-            crate::commands::index_build::build_index(
-                &mut db,
-                root.to_string_lossy().as_ref(),
-            )
-            .unwrap();
-            db.set_schema_version(0).unwrap();
-            assert_eq!(db.page_count().unwrap(), 1, "fixture must be populated");
-        }
-        let resp = search_project_inner(
-            root.to_string_lossy().into_owned(),
-            "灾备".to_string(),
-            20,
-            false,
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(!resp.results.is_empty(), "stale schema must self-heal");
-        // The rebuild must have cleared the stale flag, or every later search
-        // rebuilds again.
-        let after = crate::commands::index_db::IndexDb::open(root.to_string_lossy().as_ref())
-            .unwrap();
-        assert_eq!(
-            after.schema_version().unwrap(),
-            crate::commands::index_db::INDEX_SCHEMA_VERSION,
-            "rebuild must stamp the current version"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-```
+Expected: 对每个仍报 `never used` 的项，**说明它确实仍未被使用**——此时才保留该处 `#[allow(dead_code)]`，并在其上写一行注释说明为何保留（而不是为了消警告而盲目加回）。不得出现新的警告堆积。
 
-- [ ] **Step 2: 运行测试，确认失败**
+- [ ] **Step 2: 删除 `BuildStats.skipped`（YAGNI）**
 
-Run: `cd src-tauri && cargo test --lib missing_index_is_rebuilt_not_fatal stale_schema_version_triggers_rebuild`
+`skipped` 恒为 `0` 且 P0 中无任何读取方（`RebuildIndexDbResult` 只取 `pages`/`links`）。一个永远是 0、无人读的字段加上它的 `#[allow]` 是纯噪音。
 
-Expected: 至少一个 **FAIL**（缺库时 `search_candidates` 返回空且不会重建）。
+从 `index_build.rs` 的 `BuildStats` 删除该字段，并同步删除 `build_index` 里构造它的 `skipped: 0,` 行。Task 4 只读 `pages`/`links`，不受影响。
 
-- [ ] **Step 3: 实现自愈**
+Run: `cd src-tauri && cargo build --lib`
 
-先移除 Task 1 为未使用接口加的 `#[allow(dead_code)]`：`set_schema_version` 自本 Task 起被真实调用，`search.rs` 自本 Task 起消费 `schema_version`/`page_count`，这些属性应逐个删除（`index_db.rs` 中的四处）。保留仍未被使用的（如 `links_from` 若已删除则无）。
+Expected: 编译通过，且 `index_build.rs` 中不再有 `#[allow(dead_code)]`。
 
-在 `search_project_inner` 打开索引处替换为：
+- [ ] **Step 3: 修正文档（E13：文档与代码不符）**
 
-```rust
-    // Self-heal: the index is a discardable derivative, so a missing, empty,
-    // or stale index is rebuilt rather than surfaced as an error
-    // (spec invariant 2, Review Focus #2).
-    let mut db = IndexDb::open(&project_path)?;
-    let stale = db.schema_version().unwrap_or(0) != crate::commands::index_db::INDEX_SCHEMA_VERSION;
-    if stale || db.page_count().unwrap_or(0) == 0 {
-        let _ = crate::commands::project_maintenance::rebuild_index_db_inner(
-            project_path.clone(),
-        );
-        db = IndexDb::open(&project_path)?;
-    }
-```
+`README_CN.md:208` 与 `README_CN.md:212` 当前声称「同时搜索 wiki/ 和 raw/sources/」与「快速 ANN 检索」，与代码证据不符。改为准确描述：
 
-若 `rebuild_index_db_inner` 为私有，只加 `pub(crate)`。
+- 检索覆盖：当前索引 **`wiki/` 下的页面**；`raw/sources/` 中源文章的本地可检索能力由后续阶段（P1.1）交付，**尚未**提供。
+- 向量检索：如实描述当前状态；**在 P0.3 交付前不得声称「快速 ANN」**。
 
-- [ ] **Step 4: 运行测试，确认通过**
+同时可补一句说明 `.llm-wiki/index.db` 是磁盘 Markdown 的派生物，可删除后自动重建——这是用户可见的重要事实。
+
+- [ ] **Step 4: 全量回归并提交**
 
 Run: `cd src-tauri && cargo test --lib`
 
-Expected: 全部 **PASS**。
+Expected: 全部 **PASS**（除 7 个既有的 Windows 路径失败），且失败数与基线持平。
 
-- [ ] **Step 5: 修正文档（E13）**
+Run: `cd src-tauri && cargo clippy --lib 2>&1 | tail -20`
 
-`README_CN.md:208` 与 `README_CN.md:212` 当前声称「同时搜索 wiki/ 和 raw/sources/」与「快速 ANN 检索」，与代码不符。改为准确描述：
-
-- 检索覆盖：当前索引 `wiki/` 下的页面；`raw/sources/` 的源文章可检索能力由后续阶段（P1.1）交付。
-- 向量检索：如实描述当前是否已建 ANN 索引（P0.3 交付前不得声称「快速 ANN」）。
-
-- [ ] **Step 6: 提交**
+Expected: 无本计划新增的告警。
 
 ```bash
-git add src-tauri/src/commands/search.rs README_CN.md
-git commit -m "feat(search): self-heal missing or stale index; correct README claims
+git add src-tauri/src/commands/index_db.rs src-tauri/src/commands/index_build.rs README_CN.md
+git commit -m "chore(index): drop now-unused dead_code allowances; correct README
 
-README claimed search covered raw/sources/ and that vector search used
-a fast ANN index; neither matched the code. Both claims now describe
-what actually ships."
+The Task 1 allowances existed only because the interface had no consumers
+yet; Task 4/5 consume all of them. BuildStats.skipped was always 0 and
+read by nothing, so the field goes too.
+
+README claimed search covered raw/sources/ and that vector search used a
+fast ANN index; neither matched the code. Both claims now describe what
+actually ships, and the page documents that index.db is a rebuildable
+derivative of the Markdown."
 ```
 
 ---
-
 ## 完成标准（P0）
 
 - [ ] `cargo test --lib` 全绿，含新增的断崖、二字词、召回、自愈测试。
